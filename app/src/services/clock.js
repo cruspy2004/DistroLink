@@ -15,3 +15,4 @@ class LamportClock {
 }
 
 module.exports = new LamportClock();
+module.exports.constructor = LamportClock;
