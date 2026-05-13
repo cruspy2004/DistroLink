@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DistroLink URL Shortener</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f4f4f9; color: #333; }
+    input[type="url"] { padding: 10px; width: 300px; border: 1px solid #ccc; border-radius: 4px; }
+    button { padding: 10px 20px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    button:hover { background-color: #0056b3; }
+    #result { margin-top: 20px; font-weight: bold; }
+    a { color: #007bff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>DistroLink</h1>
+  <p>Distributed URL Shortening Service</p>
+  
+  <form id="shortenForm">
+    <input type="url" id="urlInput" placeholder="Enter long URL (e.g. https://example.com)" required>
+    <button type="submit">Shorten</button>
+  </form>
+
+  <div id="result"></div>
+
+  <script>
+    document.getElementById('shortenForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const url = document.getElementById('urlInput').value;
+      const resultDiv = document.getElementById('result');
+      
+      try {
+        const response = await fetch('/api/shorten', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+        const data = await response.json();
+        
+        if (response.ok) {
+          resultDiv.innerHTML = `Short URL: <a href="${data.short_url}" target="_blank">${data.short_url}</a>`;
+        } else {
+          resultDiv.textContent = `Error: ${data.error}`;
+        }
+      } catch (err) {
+        resultDiv.textContent = 'Failed to connect to the server.';
+      }
+    });
+  </script>
+</body>
+</html>
