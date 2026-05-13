@@ -1,0 +1,365 @@
+================================================================
+DISTROLINK — TECHNICAL DESIGN DOCUMENT
+Distributed URL Shortening Service
+================================================================
+Author       : Muhammad Haadhee Sheeraz Mian — Reg No: 478359
+Course       : Parallel & Distributed Computing (PDC)
+Version      : 1.0
+Date         : May 2026
+================================================================
+
+
+1. SYSTEM ARCHITECTURE OVERVIEW
+---------------------------------
+
+                        [ Client Browser ]
+                               |
+                        HTTP Request
+                               |
+                         [ Nginx ]
+                     Load Balancer (Round-Robin)
+                    /           |           \
+              [Node-1]      [Node-2]      [Node-3]
+              Express        Express       Express
+                    \           |           /
+                     \          |          /
+                  [ Redis ]   [ PostgreSQL ]
+                  Cache Layer  Persistent DB
+
+
+Components:
+  - Nginx          : Reverse proxy + load balancer
+  - Node.js/Express: Application servers (stateless, N instances)
+  - PostgreSQL     : Single source of truth for URL mappings
+  - Redis          : Shared distributed cache across all nodes
+  - Docker Compose : Orchestration of all services
+
+
+2. PDC CONCEPTS — IMPLEMENTATION MAPPING
+------------------------------------------
+
+2.1 Concurrency
+    - Multiple Express instances run as separate Docker containers
+    - Each handles requests in parallel (Node.js event loop + OS-level
+      parallelism via separate processes)
+    - Nginx round-robin ensures no single node is a bottleneck
+    - Validated by running k6 with 500 virtual users and checking
+      Nginx access logs show distribution across all nodes
+
+2.2 Consistency (Cache Consistency)
+    - Write-through caching strategy:
+        * On shorten: write to PostgreSQL first, then SET in Redis
+        * On redirect: check Redis first (cache hit -> redirect)
+                       on miss -> read PostgreSQL -> SET Redis -> redirect
+    - All nodes share the same Redis instance so cache is globally
+      consistent — no stale reads across nodes
+    - TTL set to 24 hours on cached entries to prevent unbounded growth
+
+2.3 Mutual Exclusion (Distributed Lock for Code Generation)
+    - Problem: two nodes generating a short code at the same millisecond
+      could produce a collision
+    - Solution: Redis SETNX (Set if Not eXists) used as a distributed lock
+        * Node requests lock: SETNX lock:codegen "node-id" EX 2
+        * If lock acquired: generate code, write to DB, release lock (DEL)
+        * If lock not acquired: retry after 10ms backoff
+    - This is the practical implementation of mutual exclusion in a
+      distributed setting — equivalent to a distributed mutex
+
+2.4 Logical Clock Synchronization (Lamport's Logical Clock)
+    - Each node maintains a local Lamport counter (integer, starts at 0)
+    - On every internal event (request received): counter++
+    - On every outgoing message/log: attach current counter value
+    - On receiving a log from another node: counter = max(local, received) + 1
+    - All redirect events are logged with their Lamport timestamp to a
+      shared PostgreSQL table (event_log) for global event ordering
+    - This demonstrates WHY logical clocks matter: two nodes may have
+      different wall-clock times but logical ordering stays consistent
+
+2.5 Fault Tolerance
+    - Nginx health checks: every 5 seconds, Nginx polls GET /health
+      on each node. If a node fails 2 consecutive checks, it is removed
+      from the load-balancing pool automatically
+    - Stateless application layer: no session or URL data lives in the
+      Node.js process. All state is in PostgreSQL (durable) and Redis
+      (shared). A node dying loses nothing.
+    - Demonstrated live: docker stop distrolink-app-1 during a k6 run.
+      Error rate should remain 0%.
+
+2.6 Global State Snapshot
+    - GET /monitor on any node returns a global state snapshot:
+        * Queries PostgreSQL for total URL count
+        * Queries Redis INFO for cache hit/miss stats
+        * Returns its own node ID and local request count
+    - This is a simplified Chandy-Lamport style snapshot:
+      we capture consistent global state without stopping the system
+
+2.7 Election Algorithm (Leader for Code Generation)
+    - To avoid distributed lock contention at scale, one node acts as
+      the "code generation leader" — all shorten requests are forwarded
+      to this node internally for code generation
+    - On startup, nodes use a Bully-style election:
+        * Each node has a numeric ID from its Docker container hostname
+        * The node with the highest ID becomes leader
+        * If the leader node goes down, remaining nodes re-elect
+    - This simplifies mutual exclusion: only the leader generates codes,
+      so SETNX locking is only needed during leader re-election
+
+
+3. DATABASE SCHEMA
+-------------------
+
+Table: urls
+  id          SERIAL PRIMARY KEY
+  short_code  VARCHAR(10) UNIQUE NOT NULL
+  original    TEXT NOT NULL
+  created_at  TIMESTAMP DEFAULT NOW()
+  hit_count   INTEGER DEFAULT 0
+
+Table: event_log
+  id            SERIAL PRIMARY KEY
+  node_id       VARCHAR(50) NOT NULL
+  event_type    VARCHAR(50) NOT NULL   -- 'shorten' | 'redirect' | 'cache_hit'
+  short_code    VARCHAR(10)
+  lamport_ts    INTEGER NOT NULL        -- Lamport logical clock value
+  wall_clock_ts TIMESTAMP DEFAULT NOW()
+
+Indexes:
+  - urls(short_code)  -- primary lookup, must be fast
+  - event_log(lamport_ts) -- for ordered event replay
+
+
+4. REDIS SCHEMA
+----------------
+
+Key pattern       | Type   | Value                  | TTL
+------------------|--------|------------------------|--------
+url:{short_code}  | String | original_url           | 86400s
+lock:codegen      | String | node-id                | 2s
+stats:hits        | Counter| INCR on cache hit      | none
+stats:misses      | Counter| INCR on cache miss     | none
+
+
+5. API SPECIFICATION
+---------------------
+
+POST /api/shorten
+  Body    : { "url": "https://example.com/very/long/path" }
+  Response: { "short_url": "http://localhost/aX3kP", "code": "aX3kP" }
+  Errors  : 400 (invalid URL), 500 (DB error)
+
+GET /:code
+  Response: HTTP 302 redirect to original URL
+  Headers : X-Cache: HIT | MISS
+            X-Node-ID: node-1
+  Errors  : 404 (code not found)
+
+GET /health
+  Response: { "status": "ok", "node": "node-1", "uptime": 3600 }
+
+GET /monitor
+  Response: {
+    "node_id": "node-1",
+    "local_requests": 1402,
+    "total_urls": 3812,
+    "cache_hits": 9823,
+    "cache_misses": 412,
+    "cache_hit_rate": "96%"
+  }
+
+
+6. SHORT CODE GENERATION
+-------------------------
+Algorithm: Base62 encoding of an auto-incremented ID
+
+Characters: 0-9, a-z, A-Z  (62 chars)
+Length    : 6 characters
+Capacity  : 62^6 = ~56 billion unique codes
+
+Steps:
+  1. Leader node acquires Redis distributed lock (SETNX)
+  2. INSERT into urls table (PostgreSQL returns new id)
+  3. Encode id to Base62 -> short_code
+  4. UPDATE urls SET short_code = encode(id) WHERE id = newId
+  5. SET Redis key url:{short_code} = original_url EX 86400
+  6. Release lock (DEL lock:codegen)
+  7. Return short_code to caller
+
+function toBase62(n):
+  chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  result = ""
+  while n > 0:
+    result = chars[n % 62] + result
+    n = floor(n / 62)
+  return result.padStart(6, '0')
+
+
+7. DOCKER COMPOSE STRUCTURE
+-----------------------------
+
+services:
+  nginx:
+    image: nginx:alpine
+    ports: ["80:80"]
+    depends_on: [app]
+    volumes: [./nginx.conf:/etc/nginx/nginx.conf]
+
+  app:
+    build: ./app
+    environment:
+      - DB_URL=postgres://...
+      - REDIS_URL=redis://redis:6379
+      - NODE_ID={{.Task.Slot}}   # unique per replica
+    depends_on: [postgres, redis]
+
+  postgres:
+    image: postgres:15
+    volumes: [pgdata:/var/lib/postgresql/data]
+    environment:
+      - POSTGRES_DB=distrolink
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+
+volumes:
+  pgdata:
+
+Scale command:
+  docker compose up --scale app=3
+
+
+8. NGINX CONFIGURATION (KEY PARTS)
+------------------------------------
+
+upstream distrolink_nodes {
+    server app:3000;          # Docker Compose resolves to all replicas
+    keepalive 32;
+}
+
+server {
+    listen 80;
+
+    location / {
+        proxy_pass http://distrolink_nodes;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location /health {
+        proxy_pass http://distrolink_nodes;
+        health_check interval=5s fails=2 passes=1;
+    }
+}
+
+
+9. LAMPORT CLOCK IMPLEMENTATION (NODE.JS)
+-------------------------------------------
+
+class LamportClock {
+  constructor() { this.time = 0; }
+
+  tick() {
+    this.time += 1;
+    return this.time;
+  }
+
+  update(receivedTime) {
+    this.time = Math.max(this.time, receivedTime) + 1;
+    return this.time;
+  }
+}
+
+// Usage in redirect handler:
+app.get('/:code', async (req, res) => {
+  const ts = clock.tick();
+  const cached = await redis.get(`url:${req.params.code}`);
+
+  if (cached) {
+    await logEvent('redirect', req.params.code, ts, 'cache_hit');
+    return res.redirect(302, cached);
+  }
+
+  const row = await db.query(
+    'SELECT original FROM urls WHERE short_code = $1',
+    [req.params.code]
+  );
+  if (!row) return res.status(404).send('Not found');
+
+  await redis.set(`url:${req.params.code}`, row.original, 'EX', 86400);
+  await logEvent('redirect', req.params.code, ts, 'cache_miss');
+  res.redirect(302, row.original);
+});
+
+
+10. TESTING PLAN
+-----------------
+
+Phase 1 — Unit Tests (Jest)
+  - Base62 encoder correctness
+  - Distributed lock acquire/release
+  - Lamport clock tick and update logic
+
+Phase 2 — Integration Tests
+  - POST /api/shorten -> GET /:code round trip
+  - Cache hit confirmed via X-Cache: HIT header
+  - 404 returned for unknown code
+
+Phase 3 — Load Testing (k6)
+  Script: 500 virtual users, 60 seconds, repeated redirects
+  Metrics collected:
+    - p50, p95, p99 redirect latency
+    - Error rate (must be 0%)
+    - Requests per second per node (from Nginx logs)
+
+Phase 4 — Fault Tolerance Test
+  1. Start k6 load test (500 VUs)
+  2. During test: docker stop distrolink-app-1
+  3. Confirm k6 shows 0 errors after node removal
+  4. Check Nginx logs confirm traffic shifted to remaining nodes
+
+Phase 5 — Scalability Test
+  Run identical k6 script against:
+    - 1 node:  record RPS
+    - 2 nodes: record RPS (expect ~2x)
+    - 3 nodes: record RPS (expect ~3x)
+  Document results in final report table
+
+
+11. PROJECT FILE STRUCTURE
+---------------------------
+
+distrolink/
+  docker-compose.yml
+  nginx/
+    nginx.conf
+  app/
+    Dockerfile
+    package.json
+    src/
+      index.js          -- Express app entry point
+      routes/
+        shorten.js      -- POST /api/shorten handler
+        redirect.js     -- GET /:code handler
+        monitor.js      -- GET /monitor handler
+      services/
+        cache.js        -- Redis interaction
+        db.js           -- PostgreSQL queries
+        codegen.js      -- Base62 + distributed lock
+        clock.js        -- Lamport clock
+        election.js     -- Leader election logic
+      middleware/
+        validate.js     -- URL validation
+  db/
+    init.sql            -- Schema creation scripts
+  tests/
+    unit/
+    integration/
+    load/
+      k6_script.js
+  docs/
+    architecture.png    -- System diagram
+    results/            -- Load test outputs
+
+================================================================
+END OF DESIGN DOCUMENT
+================================================================

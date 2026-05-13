@@ -1,0 +1,149 @@
+================================================================
+DISTROLINK — PRODUCT REQUIREMENTS DOCUMENT (PRD)
+Distributed URL Shortening Service
+================================================================
+Author       : Muhammad Haadhee Sheeraz Mian — Reg No: 478359
+Course       : Parallel & Distributed Computing (PDC)
+Version      : 1.0
+Date         : May 2026
+================================================================
+
+
+1. PRODUCT OVERVIEW
+-------------------
+DistroLink is a web-based distributed URL shortening service that
+demonstrates core distributed computing principles in a realistic,
+functional application. Users submit long URLs via a web interface
+and receive a short alias (e.g. distro.link/aX3kP). When anyone
+visits the short URL, the system resolves and redirects them to
+the original URL. The entire system runs across multiple nodes,
+a shared cache, a persistent database, and a load balancer —
+all orchestrated via Docker Compose.
+
+
+2. GOALS & NON-GOALS
+---------------------
+Goals:
+  - Shorten URLs and resolve redirects correctly at all times
+  - Demonstrate concurrent multi-node request handling
+  - Show fault tolerance when a node goes offline
+  - Achieve sub-50ms redirect latency for cached entries
+  - Demonstrate horizontal scalability by adding/removing nodes
+
+Non-Goals:
+  - User authentication or accounts
+  - Custom branded short domains
+  - Analytics dashboard (basic stats only)
+  - Cloud/production deployment
+  - Mobile app
+
+
+3. USER STORIES
+---------------
+US-01  As a user, I want to submit a long URL and receive a unique
+       short code so I can share a compact link.
+
+US-02  As a user, I want to visit a short URL and be immediately
+       redirected to the original destination.
+
+US-03  As a user, I want the system to remain available even if one
+       of the backend servers goes down.
+
+US-04  As a user, I want redirect responses to be fast (< 50ms for
+       cached URLs).
+
+US-05  As an admin/demo, I want to observe per-node request counts
+       and cache hit rates on a simple monitoring page.
+
+
+4. FUNCTIONAL REQUIREMENTS
+---------------------------
+FR-01  URL Shortening
+       - Accept a valid HTTP/HTTPS URL via POST /api/shorten
+       - Generate a unique 6-character Base62 short code
+       - Store mapping {short_code -> original_url} in PostgreSQL
+       - Return the full short URL to the client
+       - Reject duplicate submissions (return existing short code)
+
+FR-02  URL Resolution / Redirect
+       - Accept GET /:code requests
+       - Check Redis cache first; if hit, redirect immediately (HTTP 302)
+       - If cache miss, query PostgreSQL, populate cache, then redirect
+       - Return HTTP 404 if short code does not exist
+
+FR-03  Load Balancing
+       - Nginx distributes incoming requests across all active
+         application nodes using round-robin strategy
+       - Health-check endpoint GET /health returns 200 OK per node
+       - Nginx removes unresponsive nodes from rotation automatically
+
+FR-04  Fault Tolerance
+       - System must continue serving redirects when one node is stopped
+       - No data loss on node failure (data lives in PostgreSQL + Redis,
+         not in application memory)
+
+FR-05  Monitoring Page
+       - Simple GET /monitor endpoint returns JSON with:
+           * Node ID
+           * Total requests served by this node
+           * Redis cache hit count / miss count
+           * Uptime in seconds
+
+FR-06  Horizontal Scalability
+       - Adding a third node via docker compose scale app=3 must
+         increase total throughput measurably without code changes
+
+
+5. NON-FUNCTIONAL REQUIREMENTS
+--------------------------------
+NFR-01  Redirect latency < 50ms for Redis cache hits (p95)
+NFR-02  Cache hit rate > 80% under sustained repeated traffic
+NFR-03  System handles 500+ concurrent requests without errors
+NFR-04  Zero failed redirects during controlled single-node failure
+NFR-05  All services start with a single: docker compose up --build
+NFR-06  Source code must be documented (JSDoc comments minimum)
+
+
+6. DISTRIBUTED COMPUTING CONCEPTS DEMONSTRATED
+------------------------------------------------
+Concept               | How DistroLink Demonstrates It
+----------------------|-------------------------------------------
+Concurrency           | Multiple Node.js instances handle requests
+                      | simultaneously; Nginx splits load across them
+Consistency           | Redis write-through cache ensures all nodes
+                      | serve the same URL mappings
+Fault Tolerance       | Node failure detected via health checks;
+                      | traffic rerouted; no data loss
+Scalability           | docker compose scale adds nodes instantly;
+                      | throughput scales linearly
+Logical Time / Order  | Each redirect logged with a Lamport-style
+                      | sequence counter per node for event ordering
+Mutual Exclusion      | Redis SETNX used to prevent two nodes from
+                      | generating the same short code simultaneously
+                      | (distributed lock)
+Global State          | /monitor aggregates state across nodes to
+                      | give a consistent system-wide snapshot
+Paxos (lightweight)   | Leader node coordinates short-code generation
+                      | to avoid conflicts (simplified Paxos concept)
+
+
+7. CONSTRAINTS
+--------------
+- Must run entirely on a single developer machine via Docker Compose
+- No external cloud services
+- Tech stack: Node.js, Express, PostgreSQL, Redis, Nginx, Docker
+- Frontend: plain HTML/CSS/JS (no heavy framework required)
+- Must be completable by one person within the semester
+
+
+8. SUCCESS CRITERIA
+--------------------
+- demo: shorten a URL, resolve it, confirm redirect works
+- demo: docker stop one node mid-load-test, zero errors observed
+- demo: k6 load test report showing < 50ms p95 latency (cached)
+- demo: docker compose scale app=3 shows increased throughput
+- final report: Redis INFO shows cache hit rate > 80%
+
+================================================================
+END OF PRD
+================================================================
