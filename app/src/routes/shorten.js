@@ -21,7 +21,7 @@ router.post('/', async (req, res) => {
     const host = req.get('host');
     const shortUrl = `${protocol}://${host}/${shortCode}`;
 
-    res.json({ short_url: shortUrl, code: shortCode });
+    res.json({ short_url: shortUrl, code: shortCode, node_id: election.getNodeId() });
   } catch (error) {
     console.error('Shorten error:', error);
     res.status(500).json({ error: 'Internal server error' });
