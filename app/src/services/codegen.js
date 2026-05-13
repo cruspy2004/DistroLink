@@ -47,7 +47,8 @@ async function generateShortCode(originalUrl) {
       return existingAgain.rows[0].short_code;
     }
 
-    const { rows } = await db.query('INSERT INTO urls (short_code, original) VALUES ($1, $2) RETURNING id', ['T' + Date.now() + Math.random().toString(36).substr(2,5), originalUrl]);
+    const tempCode = 'T' + Math.random().toString(36).substring(2, 10).padEnd(8, '0');
+    const { rows } = await db.query('INSERT INTO urls (short_code, original) VALUES ($1, $2) RETURNING id', [tempCode, originalUrl]);
     const id = rows[0].id;
     const shortCode = toBase62(id);
     
